@@ -46,6 +46,8 @@ internal final class ConnectionManager: @unchecked Sendable {
     var candidate: EventLoopFuture<Channel>
     var readyChannelMuxPromise: EventLoopPromise<HTTP2StreamMultiplexer>
     var candidateMuxPromise: EventLoopPromise<HTTP2StreamMultiplexer>
+
+    var reportConnectionFailureTime: SuspendingClock.Instant?
   }
 
   internal struct ConnectedState {
@@ -82,9 +84,17 @@ internal final class ConnectionManager: @unchecked Sendable {
     var scheduled: Scheduled<Void>
     var reason: Error
 
-    init(from state: ConnectingState, scheduled: Scheduled<Void>, reason: Error?) {
+    var reportConnectionFailureTime: SuspendingClock.Instant?
+
+    init(
+      from state: ConnectingState,
+      scheduled: Scheduled<Void>,
+      reason: Error?,
+      readyChannelMuxPromise: EventLoopPromise<HTTP2StreamMultiplexer>? = nil,
+      reportConnectionFailureTime: SuspendingClock.Instant? = nil
+    ) {
       self.backoffIterator = state.backoffIterator
-      self.readyChannelMuxPromise = state.readyChannelMuxPromise
+      self.readyChannelMuxPromise = readyChannelMuxPromise ?? state.readyChannelMuxPromise
       self.scheduled = scheduled
       self.reason =
         reason
@@ -92,6 +102,7 @@ internal final class ConnectionManager: @unchecked Sendable {
           code: .unavailable,
           message: "Unexpected connection drop"
         )
+      self.reportConnectionFailureTime = reportConnectionFailureTime
     }
 
     init(from state: ConnectedState, scheduled: Scheduled<Void>) {
@@ -1031,8 +1042,30 @@ extension ConnectionManager {
         let scheduled = self.eventLoop.scheduleTask(in: .seconds(timeInterval: delay)) {
           self.startConnecting()
         }
+
+        // Periodically fulfill the readyChannelMuxPromise with an error in case we
+        // fail to connect for a longer time. This is a work-around to make sure that
+        // we don't leak everything that is waiting for this promise to be fulfilled.
+        let failureReportInterval = Duration.seconds(5 * 60)
+        var reportConnectionFailureTime =
+          connecting.reportConnectionFailureTime
+          ?? SuspendingClock.now.advanced(by: failureReportInterval)
+        var readyChannelMuxPromise = connecting.readyChannelMuxPromise
+        if SuspendingClock.now > reportConnectionFailureTime {
+          self.logger.debug("failing readyChannelMuxPromise due to sustained connection failure")
+          readyChannelMuxPromise.fail(reportedError)
+          readyChannelMuxPromise = self.eventLoop.makePromise()
+          reportConnectionFailureTime = SuspendingClock.now.advanced(by: failureReportInterval)
+        }
+
         self.state = .transientFailure(
-          TransientFailureState(from: connecting, scheduled: scheduled, reason: reportedError)
+          TransientFailureState(
+            from: connecting,
+            scheduled: scheduled,
+            reason: reportedError,
+            readyChannelMuxPromise: readyChannelMuxPromise,
+            reportConnectionFailureTime: reportConnectionFailureTime
+          )
         )
         // Candidate mux users are not willing to wait.
         connecting.candidateMuxPromise.fail(reportedError)
@@ -1080,7 +1113,8 @@ extension ConnectionManager {
     case let .transientFailure(pending):
       self.startConnecting(
         backoffIterator: pending.backoffIterator,
-        muxPromise: pending.readyChannelMuxPromise
+        muxPromise: pending.readyChannelMuxPromise,
+        reportConnectionFailureTime: pending.reportConnectionFailureTime
       )
 
     // We shutdown before a scheduled connection attempt had started.
@@ -1101,7 +1135,8 @@ extension ConnectionManager {
   private func startConnecting(
     backoffIterator: ConnectionBackoffIterator?,
     muxPromise: EventLoopPromise<HTTP2StreamMultiplexer>,
-    connectTimeoutOverride: TimeAmount? = nil
+    connectTimeoutOverride: TimeAmount? = nil,
+    reportConnectionFailureTime: SuspendingClock.Instant? = nil
   ) {
     let timeoutAndBackoff = backoffIterator?.next()
 
@@ -1138,7 +1173,8 @@ extension ConnectionManager {
       reconnect: reconnect,
       candidate: candidate,
       readyChannelMuxPromise: muxPromise,
-      candidateMuxPromise: self.eventLoop.makePromise()
+      candidateMuxPromise: self.eventLoop.makePromise(),
+      reportConnectionFailureTime: reportConnectionFailureTime
     )
 
     self.state = .connecting(connecting)
